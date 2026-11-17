@@ -32,6 +32,12 @@
   tr.clickable:hover { background: #ddf4ff; }
   .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; color: #fff; }
   .st-running { background: #1e88e5; } .st-done { background: #2e7d32; } .st-failed { background: #c62828; }
+  .sm-stored { background: #2e7d32; } .sm-rejected { background: #c62828; }
+  .sm-call_error { background: #6a1b9a; } .sm-not_started { background: #757575; }
+  .sm-running { background: #1e88e5; }
+  .halt { background: #fff4e5; border: 1px solid #f0b46c; border-radius: 6px;
+          padding: 7px 11px; margin-top: 8px; font-size: 13px; }
+  .halt b { color: #b26a00; }
   .muted { color: #57606a; } .mono { font-family: ui-monospace, monospace; }
   .concl { background: #f0f6ff; border-left: 4px solid #1f6feb; padding: 8px 12px; border-radius: 4px; }
   .concl.fail { background: #fff0f0; border-left-color: #c62828; }
@@ -92,18 +98,30 @@ S1003
 S1004
 S1005
 S1006</textarea>
+  <div class="grid" style="margin-top:8px">
+    <label><span>明确质控拒绝次数阈值</span>
+      <input type="number" id="qcRejectThreshold" min="0" step="1" value="0"></label>
+    <label><span>同时处理的样品数</span>
+      <input type="number" id="sampleConcurrency" min="0" step="1" value="0"></label>
+  </div>
+  <div class="hint">
+    阈值 0 = 不启用提前停止;大于 0 时,批次内<b>明确的质控拒绝样品数</b>达到该值后立即停止派发
+    尚未开始的样品(已在途的仍完成质控与入仓)。同时处理数 0 = 不限。演示钩子:样品号含
+    <span class="mono">NEG</span> → 负浓度(质控①明确拒绝);含 <span class="mono">MIX</span> →
+    返回错位样品号(质控②明确拒绝);含 <span class="mono">BAD</span> → 取数失败(调用异常,不计入拒绝)。
+  </div>
   <div style="margin-top:8px">
     <button onclick="submitBatch()">提交批次</button>
     <span class="muted" style="font-size:12px;margin-left:8px">
-      演示钩子:样品号含 NEG → 负浓度(质控①不通过);含 MIX → 返回错位样品号(质控②不通过)</span>
+      取数失败、质控服务报错、回执不明一律记为调用异常并阻断批次完整成功,不当作质控拒绝</span>
   </div>
 </section>
 
 <section>
   <h2>③ 批次列表(自动刷新;多批交错运行,记录互不串)</h2>
   <table id="batchTable">
-    <thead><tr><th>批次</th><th>状态</th><th>样品数</th><th>入仓</th><th>墙钟 s</th>
-      <th>瓶颈判定</th><th>提交时间</th><th>操作</th></tr></thead>
+    <thead><tr><th>批次</th><th>状态</th><th>样品数</th><th>入仓</th><th>明确拒绝</th>
+      <th>阈值/并发</th><th>墙钟 s</th><th>瓶颈判定</th><th>提交时间</th><th>操作</th></tr></thead>
     <tbody></tbody>
   </table>
 </section>
@@ -111,6 +129,8 @@ S1006</textarea>
 <section id="detail" hidden>
   <h2 id="detailTitle">批次详情</h2>
   <div id="conclBox"></div>
+  <div id="haltBox"></div>
+  <div id="sampleBox" style="margin-top:10px"></div>
   <div id="chainBox" style="margin-top:10px"></div>
   <div id="stageBox" style="margin-top:10px"></div>
   <h2 style="margin-top:14px">跨服务时间线(条块=一次真实调用;黄框=关键链)</h2>
@@ -130,7 +150,9 @@ S1006</textarea>
 <script>
 const STAGE_LABEL = {fetch:'取数', qc_nonneg:'质控①非负', qc_match:'质控②对应', warehouse:'入仓'};
 const STAGE_ORDER = {fetch:0, qc_nonneg:1, qc_match:2, warehouse:3};
-let currentBatch = null, currentDetail = null;
+const SAMPLE_LABEL = {stored:'已入仓', rejected:'明确拒绝', call_error:'调用异常',
+                      not_started:'未启动', running:'处理中'};
+let currentBatch = null, currentDetail = null, lastDetailRender = 0;
 
 function fmtTs(t){ if(!t) return '-'; const d=new Date(t*1000);
   return d.toLocaleTimeString('zh-CN',{hour12:false})+'.'+String(d.getMilliseconds()).padStart(3,'0'); }
@@ -157,8 +179,15 @@ async function saveConfig(){
 async function submitBatch(){
   const ids = document.getElementById('sampleIds').value.split(/[\s,，;；]+/).filter(Boolean);
   if(!ids.length){ alert('请填写样品号'); return; }
+  const threshold = Number(document.getElementById('qcRejectThreshold').value||0);
+  const concurrency = Number(document.getElementById('sampleConcurrency').value||0);
+  if(!Number.isInteger(threshold) || threshold<0 || !Number.isInteger(concurrency) || concurrency<0){
+    alert('质控拒绝阈值与同时处理数须为非负整数'); return;
+  }
   const r = await (await fetch('/api/batches',{method:'POST',
-    headers:{'Content-Type':'application/json'}, body:JSON.stringify({sample_ids:ids})})).json();
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({sample_ids:ids, qc_reject_threshold:threshold,
+                         sample_concurrency:concurrency})})).json();
   if(r.id){ openBatch(r.id); refreshBatches(); } else alert(r.error||'提交失败');
 }
 
@@ -167,25 +196,63 @@ async function refreshBatches(){
   const tb = document.querySelector('#batchTable tbody');
   tb.innerHTML = rows.map(b=>`<tr class="clickable" onclick="openBatch(${b.id})">
     <td>#${b.id}</td><td><span class="pill st-${b.status}">${b.status}</span></td>
-    <td>${b.samples}</td><td>${b.stored??'-'}</td><td>${b.wall_s??'-'}</td>
+    <td>${b.samples}</td><td>${b.stored??'-'}</td>
+    <td>${b.reject_count??0}${b.halted?' <span class="pill sm-not_started">已停止派发</span>':''}</td>
+    <td>${b.qc_reject_threshold??0} / ${b.sample_concurrency??0}</td>
+    <td>${b.wall_s??'-'}</td>
     <td>${b.bottleneck??'-'}</td><td class="mono">${fmtTs(b.created_at)}</td>
     <td><button class="ghost" onclick="event.stopPropagation();openBatch(${b.id})">详情</button></td>
   </tr>`).join('');
   if(currentBatch!==null){
     const cur = rows.find(x=>x.id===currentBatch);
-    if(cur && cur.status==='running') loadDetail(currentBatch);
+    // 运行中的批次自动刷新详情(限流，避免与列表刷新重复拉取)
+    if(cur && cur.status==='running' && Date.now()-lastDetailRender > 1200) loadDetail(currentBatch);
   }
 }
 
 async function openBatch(id){ currentBatch=id; await loadDetail(id); }
 async function loadDetail(id){
   const d = await (await fetch('/api/batches/'+id)).json();
-  currentDetail = d;
+  currentDetail = d; lastDetailRender = Date.now();
   document.getElementById('detail').hidden = false;
   document.getElementById('detailTitle').textContent =
     `批次 #${id} 详情(状态 ${d.batch.status},样品 ${d.batch.sample_ids.length} 个)`;
-  renderConclusion(d); renderChain(d); renderStages(d); renderWaterfall(d);
-  renderSpans(d); renderWarehouse(d);
+  renderConclusion(d); renderHalt(d); renderSamples(d); renderChain(d); renderStages(d);
+  renderWaterfall(d); renderSpans(d); renderWarehouse(d);
+}
+
+function renderHalt(d){
+  const s = d.scheduling;
+  const el = document.getElementById('haltBox');
+  if(!s || !s.halted){ el.innerHTML=''; return; }
+  el.innerHTML = `<div class="halt"><b>已停止派发</b>:${s.halt_reason}。
+    停止时间 ${fmtTs(s.halted_at)}。在途样品未被取消,仍完成了质控与入仓;
+    未派发样品保持"未启动",迟到上报不会让它们重新启动。</div>`;
+}
+
+function renderSamples(d){
+  const s = d.scheduling || {};
+  const list = d.samples || [];
+  const counts = {stored:0, rejected:0, call_error:0, not_started:0, running:0};
+  list.forEach(x=>counts[x.status]=(counts[x.status]||0)+1);
+  const rows = list.map(x=>`<tr>
+    <td class="mono">${x.sample_id}</td>
+    <td><span class="pill sm-${x.status}">${SAMPLE_LABEL[x.status]||x.status}</span></td>
+    <td>${x.stage?(STAGE_LABEL[x.stage]||x.stage):'-'}</td>
+    <td class="muted">${x.reason||''}</td>
+    <td class="mono">${fmtTs(x.updated_at)}</td></tr>`).join('');
+  document.getElementById('sampleBox').innerHTML =
+    `<b>逐样品状态(${list.length} 个;阈值 ${s.qc_reject_threshold??0}、同时处理数 ${s.sample_concurrency??0};`+
+    `明确拒绝 ${s.reject_count??0}/${s.qc_reject_threshold||'∞'})</b>
+     <div class="legend" style="margin:6px 0">
+       <span><i class="sm-stored"></i>入仓 ${counts.stored||0}</span>
+       <span><i class="sm-rejected"></i>明确拒绝 ${counts.rejected||0}</span>
+       <span><i class="sm-call_error"></i>调用异常 ${counts.call_error||0}</span>
+       <span><i class="sm-not_started"></i>未启动 ${counts.not_started||0}</span>
+       <span><i class="sm-running"></i>处理中 ${counts.running||0}</span>
+     </div>
+     <table><thead><tr><th>样品</th><th>状态</th><th>环节</th><th>说明</th><th>更新时间</th></tr></thead>
+     <tbody>${rows||'<tr><td colspan="5" class="muted">暂无</td></tr>'}</tbody></table>`;
 }
 
 function renderConclusion(d){
@@ -203,9 +270,12 @@ function renderChain(d){
   }
   if(!c.chain){
     document.getElementById('chainBox').innerHTML = (c && c.blocking)
-      ? `<table><thead><tr><th>阻断样品</th><th>阻断环节</th><th>明细</th></tr></thead><tbody>`+
+      ? `<table><thead><tr><th>阻断样品</th><th>类型</th><th>环节</th><th>明细</th></tr></thead><tbody>`+
         c.blocking.map(b=>`<tr><td class="mono">${b.sample_id}</td>
-          <td>${STAGE_LABEL[b.stage]||b.stage}</td><td>${b.detail}</td></tr>`).join('')+
+          <td><span class="pill sm-${b.kind==='rejected'?'rejected':b.kind==='not_started'?'not_started':'call_error'}">${
+            b.kind==='rejected'?'明确拒绝':b.kind==='not_started'?'未启动':'调用异常'}</span></td>
+          <td>${b.stage==='not_started'?'未派发':(STAGE_LABEL[b.stage]||b.stage)}</td>
+          <td>${b.detail}</td></tr>`).join('')+
         `</tbody></table>` : '';
     return;
   }
@@ -299,9 +369,12 @@ function renderWarehouse(d){
 
 async function rerun(){
   if(!currentDetail) return;
+  const s = currentDetail.scheduling || {};
   const r = await (await fetch('/api/batches',{method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({sample_ids:currentDetail.batch.sample_ids})})).json();
+    body:JSON.stringify({sample_ids:currentDetail.batch.sample_ids,
+                         qc_reject_threshold:s.qc_reject_threshold||0,
+                         sample_concurrency:s.sample_concurrency||0})})).json();
   if(r.id){ openBatch(r.id); refreshBatches(); }
 }
 

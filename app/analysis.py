@@ -97,6 +97,45 @@ def analyze(batch_id):
         "blocking": None,
     }
 
+    # 调度侧事实：明确拒绝次数、阈值、是否已停止派发、逐样品最终状态
+    st = db.get_batch_state(batch_id) or {}
+    results = {r["sample_id"]: r for r in db.get_sample_results(batch_id)}
+
+    def _derive(sid):
+        """旧批次(无逐样品记录)从真实跨度推导状态，绝不凭空标记。"""
+        if sid in wh_by_sample:
+            return "stored"
+        sps = [s for s in client if s["sample_id"] == sid]
+        if not sps:
+            return "not_started"
+        rejects = [s for s in sps if s["stage"] in ("qc_nonneg", "qc_match")
+                   and s["status"] == "failed" and "明确判定未通过" in (s["note"] or "")]
+        if rejects:
+            return "rejected"
+        return "call_error"  # 有调用记录但未入仓：取数失败或质控异常/入仓未完成
+    counts = {"stored": 0, "rejected": 0, "call_error": 0, "not_started": 0, "running": 0}
+    for sid in sample_ids:
+        row = results.get(sid)
+        s = row["status"] if row else _derive(sid)
+        counts[s] = counts.get(s, 0) + 1
+    result["sample_counts"] = counts
+    result["samples_rejected"] = counts.get("rejected", 0)
+    result["samples_call_error"] = counts.get("call_error", 0)
+    result["samples_not_started"] = counts.get("not_started", 0)
+    result["scheduling"] = {
+        "qc_reject_threshold": st.get("qc_reject_threshold", 0),
+        "sample_concurrency": st.get("sample_concurrency", 0),
+        "reject_count": st.get("reject_count", 0),
+        "halted": bool(st.get("halted")),
+        "halted_at": st.get("halted_at"),
+        "halt_reason": st.get("halt_reason", ""),
+    }
+    halt_note = ""
+    if st.get("halted"):
+        halt_note = (f"批次已达明确质控拒绝阈值 {st.get('qc_reject_threshold')}"
+                     f"(明确拒绝 {st.get('reject_count')} 个)，已停止派发尚未开始的样品；"
+                     f"在途样品仍完成质控与入仓。")
+
     if done:
         # 关键链：最后完成入仓的样品决定了批次完成时间
         last_w = max(wh, key=lambda w: w["stored_at"])
@@ -156,6 +195,14 @@ def analyze(batch_id):
         for sid in sample_ids:
             if sid in wh_by_sample:
                 continue
+            row = results.get(sid)
+            derived = row["status"] if row else _derive(sid)
+            if derived == "not_started":
+                blocking.append({"sample_id": sid, "stage": "not_started",
+                                 "kind": "not_started",
+                                 "detail": (row["reason"] if row and row["reason"]
+                                            else "未派发：批次已停止派发(无任何取数调用)")})
+                continue
             sps = [s for s in client if s["sample_id"] == sid]
             fetches = [s for s in sps if s["stage"] == "fetch"]
             eff = [s for s in fetches if s["status"] == "effective"]
@@ -163,27 +210,44 @@ def analyze(batch_id):
                 last = max(fetches, key=lambda s: s["start_ts"])
                 tries = "、".join(f"#{s['attempt']}:{s['status']}"
                                  for s in sorted(fetches, key=lambda x: x["attempt"]))
-                blocking.append({"sample_id": sid, "stage": "fetch",
+                blocking.append({"sample_id": sid, "stage": "fetch", "kind": "call_error",
                                  "detail": f"取数 {len(fetches)} 次尝试均未成功({tries});"
-                                           f"最后错误:{_err_of(last)}"})
+                                           f"最后错误:{_err_of(last)};取数失败不是质控拒绝"})
+                continue
+            rejects = [s for s in sps if s["stage"] in ("qc_nonneg", "qc_match")
+                       and s["status"] == "failed" and "明确判定未通过" in (s["note"] or "")]
+            if rejects:
+                s = rejects[0]
+                blocking.append({"sample_id": sid, "stage": s["stage"], "kind": "rejected",
+                                 "detail": f"{STAGE_LABELS[s['stage']]}明确未通过:{_err_of(s)}"})
                 continue
             bad_qc = [s for s in sps if s["stage"] in ("qc_nonneg", "qc_match")
                       and s["status"] != "ok"]
             if bad_qc:
                 s = bad_qc[0]
-                blocking.append({"sample_id": sid, "stage": s["stage"],
-                                 "detail": f"{STAGE_LABELS[s['stage']]}未通过/失败:{_err_of(s)}"})
+                blocking.append({"sample_id": sid, "stage": s["stage"], "kind": "call_error",
+                                 "detail": f"{STAGE_LABELS[s['stage']]}调用异常/回执不明"
+                                           f"(非明确拒绝):{_err_of(s)}"})
                 continue
             if not fetches:
-                blocking.append({"sample_id": sid, "stage": "fetch",
+                blocking.append({"sample_id": sid, "stage": "fetch", "kind": "call_error",
                                  "detail": "尚无取数记录(批次可能仍在运行)"})
             else:
                 blocking.append({"sample_id": sid, "stage": "warehouse",
-                                 "detail": "入仓环节未完成"})
+                                 "kind": "call_error", "detail": "入仓环节未完成"})
         result["blocking"] = blocking
-        bl = "；".join(f"样品 {b['sample_id']} 阻断于{STAGE_LABELS.get(b['stage'], b['stage'])}"
-                       f"({b['detail']})" for b in blocking) or "无阻断明细"
+        bl = "；".join(
+            f"样品 {b['sample_id']} "
+            + (b["detail"] if b.get("kind") == "not_started"
+               else f"阻断于{STAGE_LABELS.get(b['stage'], b['stage'])}({b['detail']})")
+            for b in blocking) or "无阻断明细"
         result["text"] = (
             f"批次#{batch_id} 未完成:{len(wh_by_sample)}/{len(sample_ids)} 样品入仓"
-            f"(入仓记录 {len(wh)} 条)。阻断环节: {bl}。失败批次不生成成功链。")
+            f"(入仓记录 {len(wh)} 条)。"
+            f"逐样品状态:入仓 {counts.get('stored', 0)}、明确拒绝 {counts.get('rejected', 0)}、"
+            f"调用异常 {counts.get('call_error', 0)}、未启动 {counts.get('not_started', 0)}。"
+            + (halt_note + " " if halt_note else "")
+            + f"阻断明细: {bl}。"
+            f"取数失败、质控服务报错或回执不明均已计入调用异常，不当作质控拒绝；"
+            f"任何未入仓样品都使批次不完整成功。失败批次不生成成功链。")
     return result

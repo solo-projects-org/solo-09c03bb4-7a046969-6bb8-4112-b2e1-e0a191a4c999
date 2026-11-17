@@ -30,12 +30,22 @@ async def create_batch(body: dict = Body(...)):
     ids = list(dict.fromkeys(str(s).strip() for s in raw if str(s).strip()))
     if not ids:
         return JSONResponse({"error": "样品号清单为空"}, status_code=400)
+    try:
+        threshold = int(body.get("qc_reject_threshold") or 0)
+        concurrency = int(body.get("sample_concurrency") or 0)
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "质控拒绝阈值/同时处理数须为整数"}, status_code=400)
+    if threshold < 0 or concurrency < 0:
+        return JSONResponse({"error": "质控拒绝阈值/同时处理数不能为负"}, status_code=400)
     cur = db.execute(
         "INSERT INTO batches(created_at, sample_ids, status) VALUES(?,?,?)",
         (time.time(), json.dumps(ids, ensure_ascii=False), "running"))
     bid = cur.lastrowid
+    db.init_batch_state(bid, threshold, concurrency)
+    db.seed_not_started(bid, ids)
     asyncio.create_task(pipeline.run_batch(bid, ids))
-    return {"id": bid, "samples": len(ids)}
+    return {"id": bid, "samples": len(ids),
+            "qc_reject_threshold": threshold, "sample_concurrency": concurrency}
 
 
 @app.get("/api/batches")
@@ -49,6 +59,11 @@ async def list_batches():
             c = json.loads(b["conclusion"])
             item.update({"bottleneck": c.get("bottleneck"), "wall_s": c.get("wall_s"),
                          "stored": c.get("samples_stored")})
+        st = db.get_batch_state(b["id"])
+        if st:
+            item.update({"qc_reject_threshold": st["qc_reject_threshold"],
+                         "sample_concurrency": st["sample_concurrency"],
+                         "reject_count": st["reject_count"], "halted": bool(st["halted"])})
         out.append(item)
     return out
 
@@ -62,9 +77,12 @@ async def batch_detail(bid: int):
     wh = db.query("SELECT * FROM warehouse WHERE batch_id=? ORDER BY stored_at", (bid,))
     # 结论按当前记录实时重算：迟到跨度随时可能补记，看到的一定与记录一致
     concl = analysis.analyze(bid) if spans else None
+    st = db.get_batch_state(bid)
     return {
         "batch": {"id": b["id"], "status": b["status"], "created_at": b["created_at"],
                   "finished_at": b["finished_at"], "sample_ids": json.loads(b["sample_ids"])},
+        "scheduling": st,
+        "samples": db.get_sample_results(bid),
         "spans": spans,
         "warehouse": wh,
         "conclusion": concl,

@@ -26,8 +26,10 @@ def set_config(c, **kw):
     return j["config"]
 
 
-def submit(c, ids):
-    r = c.post(f"{BASE}/api/batches", json={"sample_ids": ids}, timeout=10)
+def submit(c, ids, threshold=0, concurrency=0):
+    r = c.post(f"{BASE}/api/batches",
+               json={"sample_ids": ids, "qc_reject_threshold": threshold,
+                     "sample_concurrency": concurrency}, timeout=10)
     r.raise_for_status()
     return r.json()["id"]
 
@@ -148,6 +150,80 @@ def main():
     pref2 = {w["sample_id"] for w in d2["warehouse"]}
     check("入仓样品归属正确", all(x.startswith("X1-") for x in pref1)
           and all(x.startswith("X2-") for x in pref2))
+
+    # 9. 明确拒绝阈值 + 同时处理数=1：达到阈值后停止派发，未启动样品不再启动
+    set_config(c, source_delay_ms=150, qc_nonneg_delay_ms=150, qc_match_delay_ms=150,
+               client_timeout_ms=3000, max_attempts=3)
+    ids = ["TH-OK-1", "TH-NEG-1", "TH-OK-2", "TH-OK-3", "TH-OK-4"]
+    bid = submit(c, ids, threshold=1, concurrency=1)
+    d = wait_batch(c, bid, timeout=60)
+    status = {s["sample_id"]: s["status"] for s in d["samples"]}
+    sched = d["scheduling"]
+    check("阈值=1 批次停止派发", sched["halted"] == 1, json.dumps(sched, ensure_ascii=False))
+    check("明确拒绝计数=1", sched["reject_count"] == 1, str(sched["reject_count"]))
+    check("未启动样品标为未启动", status.get("TH-OK-3") == "not_started"
+          and status.get("TH-OK-4") == "not_started", str(status))
+    check("拒绝样品标为明确拒绝", status.get("TH-NEG-1") == "rejected", str(status))
+    check("阈值触发批次不完整成功", d["batch"]["status"] == "failed")
+    check("未启动样品无任何取数调用",
+          not [s for s in d["spans"] if s["sample_id"] == "TH-OK-3"])
+    check("逐样品状态齐全", set(status) == set(ids), str(sorted(status)))
+    check("结论含停止派发说明", "停止派发" in (d["conclusion"]["text"] or ""))
+
+    # 10. 调用异常不计入拒绝：BAD 取数失败批次，阈值=1 也不因它停止派发
+    ids = ["ERR-BAD-1", "ERR-OK-1", "ERR-OK-2", "ERR-OK-3"]
+    bid = submit(c, ids, threshold=1, concurrency=1)
+    d = wait_batch(c, bid, timeout=60)
+    status = {s["sample_id"]: s["status"] for s in d["samples"]}
+    check("取数失败记为调用异常", status.get("ERR-BAD-1") == "call_error", str(status))
+    check("调用异常不计入拒绝计数", d["scheduling"]["reject_count"] == 0)
+    check("调用异常不触发停止派发", d["scheduling"]["halted"] == 0)
+    check("调用异常仍阻断批次完整成功", d["batch"]["status"] == "failed")
+    check("其余样品仍照常入仓", len(d["warehouse"]) == 3, f"{len(d['warehouse'])}/3")
+
+    # 11. 同时处理数：并发=2 时在途样品峰值不超过 2
+    set_config(c, source_delay_ms=250)
+    ids = [f"CC-{i}" for i in range(6)]
+    bid = submit(c, ids, threshold=0, concurrency=2)
+    peak = 0
+    t_end = time.time() + 20
+    dd = None
+    while time.time() < t_end:
+        dd = c.get(f"{BASE}/api/batches/{bid}", timeout=10).json()
+        running = sum(1 for s in dd["samples"] if s["status"] == "running")
+        peak = max(peak, running)
+        if dd["batch"]["status"] != "running":
+            break
+        time.sleep(0.1)
+    check("同时处理数限制在途样品", peak <= 2, f"峰值 {peak}")
+    check("并发受限批次仍全部入仓", len(dd["warehouse"]) == 6, f"{len(dd['warehouse'])}/6")
+
+    # 12. 迟到上报不重新启动未派发样品：慢源 + 阈值=1，停止派发后等待迟到跨度补记
+    set_config(c, source_delay_ms=900, client_timeout_ms=300, max_attempts=2,
+               qc_nonneg_delay_ms=100, qc_match_delay_ms=100)
+    ids = ["LATE-NEG-1", "LATE-OK-1", "LATE-OK-2", "LATE-OK-3"]
+    bid = submit(c, ids, threshold=1, concurrency=1)
+    time.sleep(2.5)  # 等迟到跨度补记
+    d = wait_batch(c, bid, timeout=60)
+    status = {s["sample_id"]: s["status"] for s in d["samples"]}
+    check("慢源下调阈值仍停止派发", d["scheduling"]["halted"] == 1)
+    check("迟到补记后未启动样品仍为未启动",
+          status.get("LATE-OK-2") == "not_started"
+          and status.get("LATE-OK-3") == "not_started", str(status))
+    check("迟到补记后无未启动样品取数调用",
+          not [s for s in d["spans"] if s["sample_id"] in ("LATE-OK-2", "LATE-OK-3")])
+    check("慢源+阈值批次最终定稿", d["batch"]["status"] in ("done", "failed"))
+    set_config(c, source_delay_ms=300, client_timeout_ms=2000, max_attempts=3)
+
+    # 13. 阈值批次停止派发不影响其他批次：与另一批并发提交
+    b_halt = submit(c, ["ISO-NEG-1", "ISO-OK-1", "ISO-OK-2", "ISO-OK-3"],
+                    threshold=1, concurrency=1)
+    b_free = submit(c, [f"ISO-FREE-{i}" for i in range(4)], threshold=0)
+    dh, df = wait_batch(c, b_halt, timeout=60), wait_batch(c, b_free, timeout=60)
+    check("阈值批次停止派发", dh["scheduling"]["halted"] == 1)
+    check("同批提交的独立批次不受影响",
+          df["batch"]["status"] == "done" and len(df["warehouse"]) == 4,
+          f"{df['batch']['status']} {len(df['warehouse'])}/4")
 
     print()
     if FAILS:

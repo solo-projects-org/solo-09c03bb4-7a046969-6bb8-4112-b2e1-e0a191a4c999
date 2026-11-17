@@ -76,6 +76,8 @@ async def do_work(sample_id, request_id, batch_id, attempt):
         if CFG["fail_first"] and sample_id not in _seen:
             _seen.add(sample_id)
             status, err = "failed", "injected first failure (fail_first)"
+        elif "BAD" in sample_id:  # 演示钩子：持续取数失败(调用异常，非质控拒绝)
+            status, err = "failed", "injected fetch failure (BAD)"
         else:
             actual = sample_id + "-X" if "MIX" in sample_id else sample_id  # 演示钩子：错位样品号
             payload = {"sample_id": actual, "concentration": concentration_for(sample_id)}
